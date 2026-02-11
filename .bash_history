@@ -312,3 +312,12 @@ git commit -m "i"i did it"
 
 
 git status
+git add  .bash_history
+git status
+git commit -m "hello"
+git status
+git push origin main
+git remote -v
+git remote set-url origin https://github.com/saifgrawish/bom
+git remote -v
+git status
