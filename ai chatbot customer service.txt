@@ -1,0 +1,609 @@
+# Complete AI Customer Service Chatbot - WITH CRYPTO PAYMENT
+# Copy and paste this entire cell into Kaggle
+
+# ============================================================================
+# INSTALLATION & IMPORTS
+# ============================================================================
+!pip install -q transformers accelerate bitsandbytes python-telegram-bot torch sentencepiece protobuf nest-asyncio
+
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import sqlite3
+import json
+import asyncio
+import nest_asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, PreCheckoutQueryHandler
+import threading
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# Fix for Jupyter/Kaggle event loop
+nest_asyncio.apply()
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Your Telegram Bot Token
+TELEGRAM_BOT_TOKEN = "8579361468:AAHtpItEv04gCQZnLr03qHpORtAeIORgwHk"
+
+# Your Telegram User ID (owner)
+OWNER_TELEGRAM_ID = 8444333419
+
+# System Prompt - SHORT AND DIRECT RESPONSES
+SYSTEM_PROMPT = """You are a direct, efficient customer service bot. 
+
+Rules:
+- Keep responses SHORT (1-3 sentences max)
+- Be helpful but brief
+- No unnecessary words or fluff
+- Answer directly to the point
+- When customer asks about product, give quick info
+- Don't ask unnecessary questions
+
+Example good responses:
+"Our Smart Watch is $199.99, tracks fitness & GPS. 8 in stock."
+"Sure! Which product interests you?"
+"Great choice! I'll need your details next."
+
+Example bad responses (too long):
+"Thank you so much for your interest! I'd be happy to help you learn more about our amazing Smart Watch. It's a fantastic product that..."
+
+Be concise. Be helpful. Get straight to the point."""
+
+# Model Configuration
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
+
+# ============================================================================
+# DATABASE SETUP
+# ============================================================================
+
+def init_database():
+    """Initialize SQLite database with products and orders"""
+    conn = sqlite3.connect('store.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Create products table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            price REAL NOT NULL,
+            stock INTEGER NOT NULL,
+            description TEXT
+        )
+    ''')
+    
+    # Create orders table with phone and address
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            customer_name TEXT,
+            phone_number TEXT,
+            shipping_address TEXT,
+            product_id INTEGER,
+            product_name TEXT,
+            quantity INTEGER,
+            total_price REAL,
+            timestamp TEXT,
+            payment_status TEXT,
+            status TEXT
+        )
+    ''')
+    
+    # Insert sample products
+    cursor.execute('DELETE FROM products')
+    products = [
+        (1, "Wireless Headphones", 79.99, 15, "Premium noise-canceling, 30hr battery"),
+        (2, "Smart Watch", 199.99, 8, "Fitness tracking, GPS, heart monitor"),
+        (3, "Laptop Stand", 49.99, 25, "Ergonomic aluminum stand"),
+        (4, "USB-C Hub", 39.99, 30, "7-in-1 hub with HDMI & USB 3.0"),
+        (5, "Mechanical Keyboard", 129.99, 12, "RGB backlit, Cherry MX switches"),
+        (6, "Webcam 1080p", 59.99, 20, "Full HD with microphone"),
+        (7, "Phone Case", 19.99, 50, "Shockproof protective case"),
+        (8, "Power Bank", 44.99, 18, "20,000mAh fast charging"),
+    ]
+    cursor.executemany('INSERT INTO products VALUES (?, ?, ?, ?, ?)', products)
+    
+    conn.commit()
+    return conn
+
+# ============================================================================
+# DATABASE OPERATIONS
+# ============================================================================
+
+class Database:
+    def __init__(self, conn):
+        self.conn = conn
+        
+    def get_all_products(self):
+        """Get all products with availability"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM products')
+        products = cursor.fetchall()
+        return [
+            {
+                'id': p[0],
+                'name': p[1],
+                'price': p[2],
+                'stock': p[3],
+                'description': p[4],
+                'available': p[3] > 0
+            }
+            for p in products
+        ]
+    
+    def get_product_by_id(self, product_id):
+        """Get specific product"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM products WHERE id = ?', (product_id,))
+        p = cursor.fetchone()
+        if p:
+            return {
+                'id': p[0],
+                'name': p[1],
+                'price': p[2],
+                'stock': p[3],
+                'description': p[4],
+                'available': p[3] > 0
+            }
+        return None
+    
+    def create_order(self, customer_id, customer_name, phone, address, product_id, quantity=1):
+        """Create new order"""
+        cursor = self.conn.cursor()
+        
+        product = self.get_product_by_id(product_id)
+        if not product:
+            return None, "Product not found"
+        
+        if product['stock'] < quantity:
+            return None, f"Only {product['stock']} available."
+        
+        total_price = product['price'] * quantity
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        cursor.execute('''
+            INSERT INTO orders (customer_id, customer_name, phone_number, shipping_address, 
+                              product_id, product_name, quantity, total_price, timestamp, 
+                              payment_status, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (customer_id, customer_name, phone, address, product_id, product['name'], 
+              quantity, total_price, timestamp, 'pending', 'awaiting_payment'))
+        
+        self.conn.commit()
+        order_id = cursor.lastrowid
+        return order_id, None
+    
+    def confirm_payment(self, order_id):
+        """Confirm payment and update stock"""
+        cursor = self.conn.cursor()
+        
+        # Get order
+        cursor.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
+        order = cursor.fetchone()
+        
+        if not order:
+            return False
+        
+        product_id = order[5]
+        quantity = order[7]
+        
+        # Update stock
+        cursor.execute('SELECT stock FROM products WHERE id = ?', (product_id,))
+        current_stock = cursor.fetchone()[0]
+        new_stock = current_stock - quantity
+        
+        cursor.execute('UPDATE products SET stock = ? WHERE id = ?', (new_stock, product_id))
+        cursor.execute('UPDATE orders SET payment_status = ?, status = ? WHERE id = ?', 
+                      ('paid', 'confirmed', order_id))
+        
+        self.conn.commit()
+        return True
+    
+    def get_order(self, order_id):
+        """Get order details"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
+        o = cursor.fetchone()
+        if o:
+            return {
+                'id': o[0],
+                'customer_id': o[1],
+                'customer_name': o[2],
+                'phone': o[3],
+                'address': o[4],
+                'product_id': o[5],
+                'product_name': o[6],
+                'quantity': o[7],
+                'total_price': o[8],
+                'timestamp': o[9],
+                'payment_status': o[10],
+                'status': o[11]
+            }
+        return None
+    
+    def get_stock_report(self):
+        """Get current stock levels"""
+        products = self.get_all_products()
+        report = "📦 Stock:\n\n"
+        for p in products:
+            status = "✅" if p['stock'] > 10 else "⚠️" if p['stock'] > 0 else "❌"
+            report += f"{status} {p['name']}: {p['stock']}\n"
+        return report
+
+# ============================================================================
+# LLM SETUP
+# ============================================================================
+
+print("🚀 Loading AI Model...")
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True
+)
+
+print("✅ Model loaded!")
+
+# ============================================================================
+# AI CHATBOT CLASS
+# ============================================================================
+
+class CustomerServiceBot:
+    def __init__(self, model, tokenizer, database, system_prompt):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.database = database
+        self.system_prompt = system_prompt
+        self.conversation_history = {}
+        
+    def get_conversation_history(self, user_id):
+        if user_id not in self.conversation_history:
+            self.conversation_history[user_id] = []
+        return self.conversation_history[user_id]
+    
+    def add_to_history(self, user_id, role, content):
+        history = self.get_conversation_history(user_id)
+        history.append({"role": role, "content": content})
+        if len(history) > 8:
+            self.conversation_history[user_id] = history[-8:]
+    
+    def get_product_context(self):
+        products = self.database.get_all_products()
+        context = "Products:\n"
+        for p in products:
+            status = "✅" if p['available'] else "❌"
+            context += f"{p['name']} (ID:{p['id']}): ${p['price']} {status}\n"
+        return context
+    
+    def generate_response(self, user_id, user_message):
+        product_context = self.get_product_context()
+        history = self.get_conversation_history(user_id)
+        
+        messages = [
+            {"role": "system", "content": f"{self.system_prompt}\n\n{product_context}"}
+        ]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+        
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=150,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        
+        response = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+        
+        if len(response) > 200:
+            response = response[:200] + "..."
+        
+        self.add_to_history(user_id, "user", user_message)
+        self.add_to_history(user_id, "assistant", response)
+        
+        return response
+    
+    def clear_history(self, user_id):
+        if user_id in self.conversation_history:
+            self.conversation_history[user_id] = []
+
+# ============================================================================
+# TELEGRAM BOT HANDLERS
+# ============================================================================
+
+db_conn = init_database()
+database = Database(db_conn)
+ai_bot = CustomerServiceBot(model, tokenizer, database, SYSTEM_PROMPT)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    ai_bot.clear_history(user.id)
+    context.user_data.clear()
+    
+    welcome_message = f"👋 Hi {user.first_name}!\n\n"
+    welcome_message += "I'm your AI assistant. Quick & easy ordering.\n\n"
+    welcome_message += "/products - View products\n"
+    welcome_message += "/start - Restart\n\n"
+    welcome_message += "What can I help you find?"
+    
+    await update.message.reply_text(welcome_message)
+
+async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all products"""
+    products = database.get_all_products()
+    
+    keyboard = []
+    for p in products:
+        if p['available']:
+            keyboard.append([InlineKeyboardButton(
+                f"{p['name']} - ${p['price']}", 
+                callback_data=f"select_{p['id']}"
+            )])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🛍️ Select a product:", reply_markup=reply_markup)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user messages"""
+    user = update.effective_user
+    user_message = update.message.text
+    
+    # Check if waiting for phone number
+    if context.user_data.get('state') == 'awaiting_phone':
+        context.user_data['phone'] = user_message
+        context.user_data['state'] = 'awaiting_address'
+        await update.message.reply_text("✅ Got it!\n\n📍 Now send your shipping address:")
+        return
+    
+    # Check if waiting for address
+    if context.user_data.get('state') == 'awaiting_address':
+        context.user_data['address'] = user_message
+        context.user_data['state'] = None
+        
+        # Create order
+        product_id = context.user_data.get('selected_product_id')
+        product = database.get_product_by_id(product_id)
+        phone = context.user_data.get('phone')
+        address = user_message
+        
+        order_id, error = database.create_order(
+            user.id, 
+            user.first_name or "Customer",
+            phone,
+            address,
+            product_id
+        )
+        
+        if error:
+            await update.message.reply_text(f"❌ {error}")
+            return
+        
+        # Store order ID
+        context.user_data['order_id'] = order_id
+        
+        # Send payment request
+        await send_payment(update, context, product, order_id)
+        return
+    
+    # Normal AI conversation
+    response = ai_bot.generate_response(user.id, user_message)
+    
+    # Check if response mentions products
+    if any(word in response.lower() for word in ['product', 'item', 'buy', 'order', 'available']):
+        keyboard = [[InlineKeyboardButton("📦 View Products", callback_data="view_products")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(response, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(response)
+
+async def send_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, product, order_id):
+    """Send payment invoice using Telegram Stars"""
+    
+    title = f"{product['name']}"
+    description = f"Order #{order_id} - {product['description']}"
+    payload = f"order_{order_id}"
+    
+    # Convert USD to Telegram Stars (1 USD = 100 Stars approximately)
+    price_stars = int(product['price'] * 100)
+    
+    prices = [LabeledPrice(label=product['name'], amount=price_stars)]
+    
+    await context.bot.send_invoice(
+        chat_id=update.effective_chat.id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=prices
+    )
+    
+    await update.message.reply_text(
+        f"💳 Payment request sent!\n\n"
+        f"Order: #{order_id}\n"
+        f"Total: {price_stars} Stars (≈${product['price']})\n\n"
+        f"Click the invoice above to pay with Telegram Stars."
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "view_products":
+        products = database.get_all_products()
+        keyboard = []
+        for p in products:
+            if p['available']:
+                keyboard.append([InlineKeyboardButton(
+                    f"{p['name']} - ${p['price']}", 
+                    callback_data=f"select_{p['id']}"
+                )])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text("🛍️ Select a product:", reply_markup=reply_markup)
+    
+    elif query.data.startswith("select_"):
+        product_id = int(query.data.split("_")[1])
+        product = database.get_product_by_id(product_id)
+        
+        if product and product['available']:
+            context.user_data['selected_product_id'] = product_id
+            
+            message = f"✅ {product['name']}\n"
+            message += f"💰 ${product['price']}\n"
+            message += f"📦 {product['stock']} in stock\n\n"
+            message += f"📝 {product['description']}\n\n"
+            message += "Ready to order?"
+            
+            keyboard = [
+                [InlineKeyboardButton("✅ Yes, Order Now", callback_data=f"order_{product_id}")],
+                [InlineKeyboardButton("◀️ Back", callback_data="view_products")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.reply_text(message, reply_markup=reply_markup)
+        else:
+            await query.message.reply_text("❌ Out of stock.")
+    
+    elif query.data.startswith("order_"):
+        product_id = int(query.data.split("_")[1])
+        product = database.get_product_by_id(product_id)
+        
+        context.user_data['selected_product_id'] = product_id
+        context.user_data['state'] = 'awaiting_phone'
+        
+        await query.message.reply_text(
+            f"📦 Ordering: {product['name']}\n\n"
+            f"📱 Send me your phone number:"
+        )
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pre-checkout query"""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle successful payment"""
+    user = update.effective_user
+    payment = update.message.successful_payment
+    
+    # Extract order ID from payload
+    order_id = int(payment.invoice_payload.split("_")[1])
+    
+    # Confirm payment in database
+    database.confirm_payment(order_id)
+    
+    # Get order details
+    order = database.get_order(order_id)
+    
+    # Send confirmation to customer
+    await update.message.reply_text(
+        f"✅ **PAYMENT CONFIRMED!**\n\n"
+        f"Order #{order_id} is confirmed!\n"
+        f"Product: {order['product_name']}\n"
+        f"Total: ${order['total_price']}\n\n"
+        f"📦 Shipping to:\n{order['address']}\n\n"
+        f"We'll contact you at: {order['phone']}\n\n"
+        f"Thank you! 🎉",
+        parse_mode='Markdown'
+    )
+    
+    # Send notification to owner
+    try:
+        owner_message = f"💰 **PAYMENT RECEIVED**\n\n"
+        owner_message += f"Order #{order_id}\n"
+        owner_message += f"Customer: {user.first_name} (@{user.username or 'N/A'})\n"
+        owner_message += f"Phone: {order['phone']}\n"
+        owner_message += f"Product: {order['product_name']}\n"
+        owner_message += f"Price: ${order['total_price']}\n\n"
+        owner_message += f"📍 Ship to:\n{order['address']}\n\n"
+        owner_message += database.get_stock_report()
+        
+        await context.bot.send_message(
+            chat_id=OWNER_TELEGRAM_ID,
+            text=owner_message,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        print(f"Owner notification failed: {e}")
+
+# ============================================================================
+# MAIN BOT RUNNER
+# ============================================================================
+
+async def run_bot():
+    """Run Telegram bot"""
+    print("\n🤖 Starting Bot...")
+    print(f"✅ Token configured")
+    print(f"✅ Owner ID: {OWNER_TELEGRAM_ID}")
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("products", show_products))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    
+    await application.initialize()
+    await application.start()
+    
+    print("✅ Bot running!")
+    print("📱 Send /start to your bot!")
+    print("\n💰 Crypto payments enabled (Telegram Stars)")
+    print("⚠️ Keep this cell running!\n")
+    
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        print("\n👋 Stopping...")
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
+# ============================================================================
+# START THE BOT
+# ============================================================================
+
+print("\n" + "="*60)
+print("🚀 AI CUSTOMER SERVICE BOT WITH CRYPTO PAYMENT")
+print("="*60)
+print(f"✅ Model: {MODEL_NAME}")
+print(f"✅ Products: {len(database.get_all_products())}")
+print(f"✅ Short reply mode: ON")
+print(f"✅ Crypto payments: Telegram Stars")
+print("="*60 + "\n")
+
+try:
+    asyncio.run(run_bot())
+except KeyboardInterrupt:
+    print("\n👋 Bot stopped")
+except Exception as e:
+    print(f"\n❌ Error: {e}")
+    import traceback
+    traceback.print_exc()
