@@ -27,10 +27,10 @@ nest_asyncio.apply()
 # ============================================================================
 
 # Your Telegram Bot Token
-TELEGRAM_BOT_TOKEN = "8579361468:AAHtpItEv04gCQZnLr03qHpORtAeIORgwHk"
+TELEGRAM_BOT_TOKEN = ""
 
 # Your Telegram User ID (owner)
-OWNER_TELEGRAM_ID = 8444333419
+OWNER_TELEGRAM_ID = 
 
 # System Prompt - SHORT AND DIRECT RESPONSES
 SYSTEM_PROMPT = """You are a direct, efficient customer service bot. 
@@ -606,4 +606,5 @@ except KeyboardInterrupt:
 except Exception as e:
     print(f"\n❌ Error: {e}")
     import traceback
+
     traceback.print_exc()
